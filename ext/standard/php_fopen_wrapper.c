@@ -69,6 +69,33 @@ typedef struct php_stream_input { /* {{{ */
 } php_stream_input_t;
 /* }}} */
 
+static void php_stream_input_ensure_post_read_until(php_stream *body, zend_off_t position) /* {{{ */
+{
+	size_t read_bytes;
+	while (SG(read_post_bytes) < (int64_t)position) {
+
+		char buffer[SAPI_POST_BLOCK_SIZE];
+
+		read_bytes = sapi_read_post_block(buffer, SAPI_POST_BLOCK_SIZE);
+
+		if (read_bytes > 0) {
+			php_stream_seek(body, 0, SEEK_END);
+			if (php_stream_write(body, buffer, read_bytes) != read_bytes) {
+				/* if parts of the stream can't be written, purge it completely */
+				php_stream_truncate_set_size(body, 0);
+				php_error_docref(NULL, E_WARNING, "php://input data can't be buffered; all data discarded");
+				break;
+			}
+		}
+
+		if (read_bytes < SAPI_POST_BLOCK_SIZE) {
+			/* done */
+			break;
+		}
+	}
+}
+/* }}} */
+
 static size_t php_stream_input_write(php_stream *stream, const char *buf, size_t count) /* {{{ */
 {
 	return -1;
@@ -80,15 +107,7 @@ static size_t php_stream_input_read(php_stream *stream, char *buf, size_t count)
 	php_stream_input_t *input = stream->abstract;
 	size_t read;
 
-	if (!SG(post_read) && SG(read_post_bytes) < (int64_t)(input->position + count)) {
-		/* read requested data from SAPI */
-		size_t read_bytes = sapi_read_post_block(buf, count);
-
-		if (read_bytes > 0) {
-			php_stream_seek(input->body, 0, SEEK_END);
-			php_stream_write(input->body, buf, read_bytes);
-		}
-	}
+	php_stream_input_ensure_post_read_until(input->body, input->position + count);
 
 	if (!input->body->readfilters.head) {
 		/* If the input stream contains filters, it's not really seekable. The
@@ -127,8 +146,23 @@ static int php_stream_input_seek(php_stream *stream, zend_off_t offset, int when
 	php_stream_input_t *input = stream->abstract;
 
 	if (input->body) {
+		switch (whence) {
+			case SEEK_SET:
+				php_stream_input_ensure_post_read_until(input->body, offset);
+				break;
+			case SEEK_CUR:
+				php_stream_input_ensure_post_read_until(input->body, (input->body)->position + offset);
+				break;
+			case SEEK_END:
+				php_stream_input_ensure_post_read_until(input->body, LLONG_MAX);
+				break;
+			default:
+				php_stream_input_ensure_post_read_until(input->body, (input->body)->position + offset);
+		}
+
 		int sought = php_stream_seek(input->body, offset, whence);
 		*newoffset = (input->body)->position;
+		input->position = (input->body)->position;
 		return sought;
 	}
 
